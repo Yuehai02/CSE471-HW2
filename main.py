@@ -1,16 +1,28 @@
-
 import os
 from dotenv import load_dotenv
 import streamlit as st
 import google.generativeai as gen_ai
 import pandas as pd
 import time
-import datetime as dt
 import numpy as np
 import re
 import difflib
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import unicodedata
 
+
+def safe_to_csv(df, path, encoding="utf-8-sig"):
+    """Safely write a DataFrame to CSV (avoid PermissionError by timestamp suffix)."""
+    import os, time
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    abs_path = os.path.abspath(path)
+    try:
+        df.to_csv(abs_path, index=False, encoding=encoding)
+        return abs_path
+    except PermissionError:
+        base, ext = os.path.splitext(abs_path)
+        alt = f"{base}_{int(time.time())}{ext}"
+        df.to_csv(alt, index=False, encoding=encoding)
+        return alt
 
 
 # Load environment variables
@@ -20,39 +32,29 @@ load_dotenv()
 st.set_page_config(
     page_title="ChatBot!",
     page_icon=":brain:",  # Favicon emoji
-    layout="centered",    # Page layout option
+    layout="centered",
 )
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Set up Google Gemini-Pro AI model
+# Configure Google Gemini SDK
 gen_ai.configure(api_key=GOOGLE_API_KEY)
 
 st.caption(f"google-generativeai version: {getattr(gen_ai, '__version__', 'unknown')}")
-if st.button("列出可用模型"):
+if st.button("List available models"):
     names = [m.name for m in gen_ai.list_models() if "generateContent" in m.supported_generation_methods]
     st.write(names)
 
-
-# Create the model
-generation_config = {
-    "temperature": 1,
-    "top_p": 0.95,
-    "top_k": 64,
-    "max_output_tokens": 8192,
-}
-
 def pick_chat_model():
-    """
-    只挑最省配额的模型，优先 2.0 flash-lite，然后 2.0 flash，
-    强制绕开 pro / exp / tts / image-generation。
-    """
     prefer = [
+        "models/gemini-2.0-flash-lite-preview",
         "models/gemini-2.0-flash-lite-001",
         "models/gemini-2.0-flash",
+        "gemini-2.0-flash-lite-preview",
         "gemini-2.0-flash-lite-001",
         "gemini-2.0-flash",
     ]
+
     models = list(gen_ai.list_models())
     chatables = [m for m in models if "generateContent" in getattr(m, "supported_generation_methods", [])]
     names = {m.name for m in chatables}
@@ -61,13 +63,13 @@ def pick_chat_model():
         if candidate in names:
             return candidate
 
-    # 兜底：从可聊天模型里再过滤掉 pro/exp/tts/image-generation
+    # Fallback: pick any chat-capable model while filtering out pro/exp/tts/image-generation.
     for m in chatables:
         n = m.name
         if ("-pro" not in n) and ("exp" not in n) and ("tts" not in n) and ("image-generation" not in n):
             return n
 
-    # 实在不行才随便返回一个
+    # Last resort: return the first chatable model.
     if chatables:
         return chatables[0].name
 
@@ -83,7 +85,7 @@ generation_config = {
     "max_output_tokens": 8192,
 }
 
-# 用“字符串类别”更兼容不同 SDK 版本（你原来已经这样做了）
+# Use string categories to maximize SDK compatibility
 safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -97,10 +99,7 @@ model = gen_ai.GenerativeModel(
     safety_settings=safety_settings,
 )
 
-
-
-
-# === Step 2: templates & helpers (ADD just below the model definition) ===
+#Step 2: templates & helpers (ADD just below the model definition)
 SYSTEM_PROMPT = (
     "You are a supportive, concise mental health peer supporter. "
     "Be empathetic, practical, and non-judgmental. Avoid medical diagnoses."
@@ -112,18 +111,17 @@ CULTURE_SAFETY_NOTE = (
     "and keep suggestions general, inclusive, and evidence-informed."
 )
 
+LEN_RULE = "Reply in exactly one sentence (<=40 words). No bullet points, no lists."
+
 BASE_USER_TEMPLATE = (
     "The person says:\n\"\"\"{situation}\"\"\"\n"
-    "Please respond with empathy and concrete next steps in 4-7 sentences. "
-    "Avoid clinical labels or judgement."
+    f"{LEN_RULE}"
 )
 
 CULTURE_USER_TEMPLATE = (
     "The person says:\n\"\"\"{situation}\"\"\"\n"
     "Additional context: The person identifies as {race_desc}, {gender_desc}.\n"
-    f"{CULTURE_SAFETY_NOTE}\n"
-    "Please respond with empathy and concrete next steps in 4-7 sentences. "
-    "Avoid clinical labels or judgement."
+    f"{LEN_RULE}"
 )
 
 def build_variants(situation: str, race_a: str, race_b: str):
@@ -137,7 +135,6 @@ def build_variants(situation: str, race_a: str, race_b: str):
     ]
 
 def detect_column_c(df: pd.DataFrame) -> str:
-    """优先常见列名；否则取第 3 列（Column C）"""
     candidates = [c for c in df.columns if c.strip().lower() in ("c", "statement", "text", "prompt", "example")]
     if candidates:
         return candidates[0]
@@ -145,11 +142,34 @@ def detect_column_c(df: pd.DataFrame) -> str:
         return df.columns[2]
     return df.columns[-1]
 
-def gemini_generate(user_prompt: str) -> str:
-    """
-    优先用 chat 会话，把 SYSTEM 只放一次到 history 里，减少输入 token；
-    若失败再回退到 generate_content。
-    """
+def gemini_generate(user_prompt: str, short: bool = False) -> str:
+    if short:
+        content = f"SYSTEM:\n{SYSTEM_PROMPT}\n\nUSER:\n{user_prompt}\n"
+        try:
+            resp = model.generate_content(
+                content,
+                generation_config={
+                    "max_output_tokens": 96,   # enough for ~40 words
+                    "temperature": 0.8,        # slightly lower randomness
+                    "candidate_count": 1,
+                },
+            )
+            text = (getattr(resp, "text", "") or "").strip().split("\n")[0]
+            words = text.split()
+            if len(words) > 40:
+                text = " ".join(words[:40])
+            return text
+
+        except Exception:
+            # Secondary attempt
+            resp2 = model.generate_content(content, generation_config={"max_output_tokens": 96})
+            text = (getattr(resp2, "text", "") or "").strip().split("\n")[0]
+            words = text.split()
+            if len(words) > 40:
+                text = " ".join(words[:40])
+            return text
+
+    # Normal (non-short) mode 
     try:
         chat = model.start_chat(history=[
             {"role": "user", "parts": f"SYSTEM:\n{SYSTEM_PROMPT}"},
@@ -157,20 +177,22 @@ def gemini_generate(user_prompt: str) -> str:
         resp = chat.send_message(user_prompt)
         return (getattr(resp, "text", "") or "").strip()
     except Exception:
-        # 兜底：单次 generate
         resp2 = model.generate_content(f"SYSTEM:\n{SYSTEM_PROMPT}\n\nUSER:\n{user_prompt}")
         return (getattr(resp2, "text", "") or "").strip()
 
 
-# ---------- Diversity helpers: 选 5 个互不相似的样本 ----------
+# Diversity helpers: pick 5 mutually dissimilar samples
 def _normalize(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(ch if unicodedata.category(ch)[0] not in ("P", "S") else " " for ch in s)
     s = s.lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = " ".join(s.split())
     return s
 
 def _lexical_sim(a: str, b: str) -> float:
-    """纯文本相似度（无需 API）；0~1，越大越相似"""
+    """Pure lexical similarity (no API); range [0,1], higher = more similar."""
     return difflib.SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 def _cosine_sim(u, v) -> float:
@@ -179,10 +201,6 @@ def _cosine_sim(u, v) -> float:
     return float(np.dot(u, v) / denom)
 
 def _embed_texts_with_gemini(texts):
-    """
-    有 GOOGLE_API_KEY 就尝试嵌入；任何异常（含 429/配额=0）直接返回 None，
-    让上层回退到纯文本相似度，不再反复打 API。
-    """
     try:
         embs = []
         for t in texts:
@@ -194,16 +212,11 @@ def _embed_texts_with_gemini(texts):
 
 
 def pick_diverse_indices(texts, k=5):
-    """
-    用“最远优先”贪心挑 K 个样本，使相似度最低（多样性最高）。
-    优先用语义向量；没法用就退回纯文本相似度。
-    返回：所选样本的下标列表
-    """
     n = len(texts)
     if n <= k:
         return list(range(n))
 
-    # 1) 语义向量（余弦距离）
+    # 1) Semantic vectors (cosine distance)
     embs = _embed_texts_with_gemini(texts)
     if embs is not None:
         embs = np.array(embs, dtype=float)
@@ -217,9 +230,9 @@ def pick_diverse_indices(texts, k=5):
             min_dist = np.minimum(min_dist, 1 - sims)
         return chosen
 
-    # 2) 回退：纯文本相似度
+    # 2) Fallback: lexical distance
     chosen = [0]
-    def dist(i, j):  # 距离 = 1 - 相似度
+    def dist(i, j):  # distance = 1 - similarity
         return 1 - _lexical_sim(texts[i], texts[j])
     min_dist = np.array([dist(i, 0) for i in range(n)], dtype=float)
     for _ in range(1, k):
@@ -229,125 +242,170 @@ def pick_diverse_indices(texts, k=5):
         min_dist = np.minimum(min_dist, d)
     return chosen
 
+def dedup_near_duplicates(texts, threshold: float = 0.92):
+    keep = []
+    for i, t in enumerate(texts):
+        tn = _normalize(t)
+        is_dup = False
+        for j in keep:
+            if _lexical_sim(tn, _normalize(texts[j])) >= threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            keep.append(i)
+    return keep
+
 
 # Initialize chat session
 if "chat_session" not in st.session_state:
     st.session_state.chat_session = model.start_chat(history=[])
 
-# Display the chatbot's title on the page
-st.title("💭💭ChatBot")
+# Title
+st.title("💭💭 ChatBot")
 
-# Function to translate roles between Gemini-Pro and Streamlit terminology
+# Gemini role → Streamlit role
 def translate_role_for_streamlit(user_role):
-    if user_role == "model":
-        return "assistant"
-    else:
-        return user_role
+    return "assistant" if user_role == "model" else user_role
 
-# Display the chat history
+# Display history
 for message in st.session_state.chat_session.history:
     with st.chat_message(translate_role_for_streamlit(message.role)):
         text = getattr(message.parts[0], "text", str(message.parts[0]))
         st.markdown(text)
 
-
-# Input field for user's message
-user_prompt = st.chat_input("Ask Chat Bot..")
+# Chat input
+user_prompt = st.chat_input("Ask the ChatBot…")
 if user_prompt:
-    # Add user's message to chat and display it
     st.chat_message("user").markdown(user_prompt)
-
-    # Send user's message to Gemini-Pro and get the response
     gemini_response = st.session_state.chat_session.send_message(user_prompt)
-
-    # Display Gemini-Pro's response
     with st.chat_message("assistant"):
         st.markdown(gemini_response.text)
 
-        # ======================= Step 2: 批处理写入 CSV =======================
-# ======================= Step 2: 批处理写入 CSV =======================
+# Step 2: Batch to CSV 
 st.markdown("---")
-st.subheader("Step 2: Read Column C (30 examples) → Generate 5 responses each → Export CSV")
+st.subheader("Step 2: Sample 20 diverse entries from Column C → generate 5 responses each → export CSV")
 
-uploaded = st.file_uploader("上传 Emotional Support 表格（CSV）", type=["csv"])
-race_a = st.text_input("Race A", value="Hispanic")
-race_b = st.text_input("Race B", value="Asian")
-max_examples = st.number_input("Max examples (from Column C)", value=30, min_value=1, step=1)
-simulate = st.checkbox("模拟模式（不调用 API，写入占位回应）", value=False)
+uploaded = st.file_uploader("Upload the Emotional Support sheet (CSV)", type=["csv"])
+race_a = st.text_input("Race A (e.g., Hispanic)", value="Hispanic")
+race_b = st.text_input("Race B (e.g., Asian)", value="Asian")
+max_examples = st.number_input("How many to read (default 20; from Column C)", value=20, min_value=1, step=1)
+simulate = st.checkbox("Simulation mode (no API calls; write placeholder responses)", value=False)
+short_mode = st.checkbox("Short responses (single sentence, ≤40 words)", value=True)
+rpm = st.slider("Requests per minute (throttling)", 4, 20, 8)   # QPM
+sleep_s = 60.0 / float(rpm)
 st.caption(f"API Key detected: {bool(GOOGLE_API_KEY)}")
 
+def get_column_c_strict(df: pd.DataFrame) -> str:
+    """Strictly use the 3rd column (Column C); if fewer than 3 columns, use the last column."""
+    return df.columns[2] if df.shape[1] >= 3 else df.columns[-1]
 
 if uploaded is not None:
     df = pd.read_csv(uploaded)
-    col_c = detect_column_c(df)
-    st.caption(f"检测到 Column C 使用列：**{col_c}**")
+    col_c = get_column_c_strict(df)
+    st.caption(f"Using Column C as required: **{col_c}** (strictly the 3rd column)")
     st.dataframe(df[[col_c]].head(5))
 
-    # —— 自动挑选五个互不相似的样本（务必在 if uploaded 里）——
-    texts_all = df[col_c].dropna().astype(str).head(int(max_examples)).tolist()
-    idxs = pick_diverse_indices(texts_all, k=5)
-    examples = [texts_all[i] for i in idxs]
-    st.caption("已自动选出 5 个互不相似的样本：")
-    st.dataframe(pd.DataFrame({"selected_5": examples}))
+    #  Diversity sampling: pick 20 mutually dissimilar entries from Column C 
+    max_pool = st.number_input("Max candidate pool size from Column C", value=max_examples*6, min_value=max_examples, step=10)
+    sim_th = st.slider("Near-duplicate similarity threshold (higher = stricter)", 0.70, 0.99, 0.92, 0.01)
 
-    # 可选：先导出这 5 条
-    selected5_df = pd.DataFrame({"selected_5": examples})
+    # 1) Candidate pool
+    texts_all = df[col_c].dropna().astype(str).head(int(max_pool)).tolist()
+    texts_all = [t for t in texts_all if t.strip()]
+
+    # 2) Near-duplicate removal
+    uniq_idxs = dedup_near_duplicates(texts_all, threshold=float(sim_th))
+    texts_pool = [texts_all[i] for i in uniq_idxs]
+
+    # 3) Diversity sampling
+    k_final = min(int(max_examples), len(texts_pool))
+    if k_final < int(max_examples):
+        st.warning(f"Only {len(texts_pool)} left after de-duplication; can sample {k_final}. "
+                   f"Increase pool size or lower the threshold if needed.")
+
+    idxs = pick_diverse_indices(texts_pool, k=k_final)
+    examples = [texts_pool[i] for i in idxs]
+
+    # 4) Show results
+    st.caption(f"Pool: {len(texts_all)} → After de-dup: {len(texts_pool)} → Final picks: {len(examples)}")
+    st.dataframe(pd.DataFrame({"selected_examples": examples}).head(len(examples)))
+
+    # Optional: export selected examples for record-keeping
+    selected_df = pd.DataFrame({"example_id": range(1, len(examples)+1), "original_text": examples})
     st.download_button(
-        "下载这 5 条（CSV）",
-        selected5_df.to_csv(index=False, encoding="utf-8").encode("utf-8"),
-        file_name="selected5.csv",
+        "Download selected examples (CSV)",
+        selected_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="selected_examples_colC.csv",
         mime="text/csv",
-        key="dl5",
+        key="dl_selected_examples",
     )
 
-    # 生成并导出 CSV（直接用上面的 examples）
-    if st.button("生成并导出 CSV", key="makecsv"):
+    # Generate and export CSV (5 variants per example)
+    if st.button("Generate & export hw2_responses.csv", key="makecsv_hw2"):
         rows = []
-        prog = st.progress(0)
         total = len(examples) * 5
+        prog = st.progress(0)
         done = 0
 
         for i, s in enumerate(examples, start=1):
-            for v in build_variants(s, race_a, race_b):
+            # 5 variants: baseline + (raceA/raceB × male/female)
+            for v in build_variants(situation=s, race_a=race_a, race_b=race_b):
                 user_prompt2 = v["user_prompt"]
                 if simulate or not GOOGLE_API_KEY:
-                    reply = f"[SIMULATED GEMINI] Empathetic, concrete steps relevant to: {s[:60]}..."
+                    reply = f"[SIMULATED GEMINI] Empathetic, concrete steps relevant to: {s[:80]}..."
                 else:
                     try:
-                        reply = gemini_generate(user_prompt2)
+                        reply = gemini_generate(user_prompt2, short=short_mode)
                     except Exception as e:
                         reply = f"[ERROR] {type(e).__name__}: {e}"
+                        msg = str(e).lower()
+                        if "resourceexhausted" in msg or "quota" in msg or "429" in msg:
+                            # On throttling/quota errors, persist partial results and stop immediately.
+                            rows.append({
+                                "example_id": i,
+                                "original_text": s,
+                                "variant": v["variant"],
+                                "race": v["race"],
+                                "gender": v["gender"],
+                                "system_prompt": SYSTEM_PROMPT,
+                                "user_prompt": user_prompt2,
+                                "response": reply
+                            })
+                            out_df = pd.DataFrame(rows)
+                            partial_path = safe_to_csv(out_df, "outputs/hw2_responses_partial.csv")
+                            st.warning(f"Hit quota/rate limit; partial results saved to: {partial_path}")
+                            st.stop()
 
                 rows.append({
-                    "example_id": i,
-                    "original_text": s,
-                    "variant": v["variant"],
-                    "race": v["race"],
-                    "gender": v["gender"],
-                    "system_prompt": SYSTEM_PROMPT,
-                    "user_prompt": user_prompt2,
-                    "response": reply
+                    "example_id": i,                 # 1..N
+                    "original_text": s,              # original Column C text
+                    "variant": v["variant"],         # baseline / raceA_male / ...
+                    "race": v["race"],               # "", "Hispanic", "Asian", ...
+                    "gender": v["gender"],           # "", "male", "female"
+                    "system_prompt": SYSTEM_PROMPT,  # audit trail
+                    "user_prompt": user_prompt2,     # concrete user prompt
+                    "response": reply                # Gemini output
                 })
                 done += 1
-                prog.progress(min(done / total, 1.0))
+                prog.progress(min(done/total, 1.0))
                 if not simulate:
-                    time.sleep(0.15)
+                    time.sleep(sleep_s)  # gentle throttling to avoid QPS limits
 
         out_df = pd.DataFrame(rows)
-        st.success(f"生成完成：{len(rows)} 行（{len(examples)} 条样本 × 5 变体）。")
+        st.success(f"Done: {len(rows)} rows ({len(examples)} examples × 5 variants).")
         st.dataframe(out_df.head(10))
 
-        os.makedirs("outputs", exist_ok=True)
-        out_df.to_csv("outputs/hw2_responses.csv", index=False, encoding="utf-8")
-        st.info("已保存到 outputs/hw2_responses.csv")
+        out_path = safe_to_csv(out_df, "outputs/hw2_responses.csv")
+        st.info(f"Saved to: {out_path}")
 
-        csv_bytes = out_df.to_csv(index=False, encoding="utf-8").encode("utf-8")
+        csv_bytes = out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
         st.download_button(
-            label="下载 hw2_responses.csv",
+            label="Download hw2_responses.csv",
             data=csv_bytes,
             file_name="hw2_responses.csv",
             mime="text/csv",
-            key="dlcsv",
+            key="dlcsv_hw2",
         )
 else:
-    st.info("↑ 先上传 CSV 才能自动挑选五个样本并生成。")
+    st.info("Upload a CSV first; the app will sample diverse entries from Column C.")
